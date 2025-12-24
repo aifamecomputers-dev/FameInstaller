@@ -59,27 +59,50 @@ function Wait-For-InstallerIdle {
 function Get-RemoteInstallFiles {
   param([Parameter(Mandatory=$true)][string]$BaseUrl)
 
-  # PowerShell 5.1-safe interpolation: avoid "$BaseUrl?get=basic"
+  # PowerShell 5.1-safe string interpolation (avoid "$BaseUrl?get=basic")
   $basicUrl = if ($BaseUrl.EndsWith("/")) { "$($BaseUrl)?get=basic" } else { "$($BaseUrl)/?get=basic" }
 
   Write-Log "Fetching file list: $basicUrl"
   $html = (Invoke-WebRequest -Uri $basicUrl -UseBasicParsing).Content
 
-  $hrefs = [regex]::Matches($html, 'href="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+  # 1) Collect href values (double + single quotes)
+  $hrefs = @()
+  $hrefs += [regex]::Matches($html, 'href="([^"]+)"', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }
+  $hrefs += [regex]::Matches($html, "href='([^']+)'",  'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }
 
-  $files = $hrefs |
-    Where-Object { $_ -and ($_ -match '\.(exe|msi)$') } |
+  # 2) Collect plain-text filenames anywhere in content
+  # (this catches listings that are not traditional <a href>)
+  $plain = [regex]::Matches($html, '(?i)[A-Za-z0-9][A-Za-z0-9 _\-\.\(\)%]*\.(exe|msi)') |
+           ForEach-Object { $_.Value }
+
+  $candidates = @($hrefs + $plain)
+
+  # Normalize + decode + filter
+  $files = $candidates |
+    Where-Object { $_ } |
     ForEach-Object { [System.Uri]::UnescapeDataString($_) } |
+    ForEach-Object { $_.Trim() } |
+    # Only final filenames (strip any query strings/fragments)
+    ForEach-Object { ($_ -split '[\?#]')[0] } |
+    # Keep only exe/msi
+    Where-Object { $_ -match '(?i)\.(exe|msi)$' } |
+    # Drop obvious garbage cases
     Where-Object {
+      $_ -notmatch '^\(2\)\.exe$' -and
+      $_ -notmatch '^\.\.?/?$' -and
       $_ -notmatch '\.config$' -and
       $_ -notmatch '^application\.config$' -and
       $_ -notmatch '^user\.config$'
     } |
     Select-Object -Unique
 
-  if (-not $files -or $files.Count -eq 0) { throw "No .exe/.msi installers found at $basicUrl" }
+  if (-not $files -or $files.Count -eq 0) {
+    throw "No .exe/.msi installers found at $basicUrl"
+  }
+
   return $files
 }
+
 
 function Download-File {
   param([string]$Url, [string]$OutPath, [int]$Retries = 4)

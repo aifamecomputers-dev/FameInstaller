@@ -118,11 +118,26 @@ function Download-File {
       # Helpful: reduce SmartScreen/MOTW issues
       try { Unblock-File -Path $OutPath -ErrorAction SilentlyContinue } catch {}
 
-      # Fail fast if we downloaded an HTML error page (WAF/403/404)
-      $head = Get-Content -Path $OutPath -TotalCount 2 -ErrorAction SilentlyContinue
-      if ($head -match '<!DOCTYPE html>|<html') {
-        throw "Downloaded HTML instead of installer. URL may be blocked or requires auth: $Url"
-      }
+        # Fail fast if we downloaded an HTML error page (WAF/403/404) — binary-safe
+        try {
+        $fs = [System.IO.File]::Open($OutPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::ReadWrite)
+        try {
+            $buf = New-Object byte[] 2048
+            $n = $fs.Read($buf, 0, $buf.Length)
+            $txt = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+            if ($txt -match '<!DOCTYPE html>|<html') {
+            throw "Downloaded HTML instead of installer. URL may be blocked or requires auth: $Url"
+            }
+        } finally {
+            $fs.Close()
+        }
+        } catch {
+        Write-Log "Binary header check skipped: $($_.Exception.Message)" "WARN"
+        }
+
 
       Write-Log "Download OK: $OutPath" "OK"
       return
@@ -141,24 +156,37 @@ function Get-UninstallRegistrySnapshot {
     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
   )
 
-  foreach ($path in $paths) {
+  $items = foreach ($path in $paths) {
     Get-ItemProperty $path -ErrorAction SilentlyContinue | ForEach-Object {
-      $dn = $_.PSObject.Properties['DisplayName']
-      if (-not $dn -or [string]::IsNullOrWhiteSpace($dn.Value)) { return }
+
+      # StrictMode-safe: DisplayName may not exist
+      $dnProp = $_.PSObject.Properties["DisplayName"]
+      if (-not $dnProp -or [string]::IsNullOrWhiteSpace([string]$dnProp.Value)) { return }
+
+      # Safe property getter for PS5.1
+      $get = {
+        param($obj, [string]$name)
+        $p = $obj.PSObject.Properties[$name]
+        if ($p) { $p.Value } else { $null }
+      }
 
       [pscustomobject]@{
         KeyName              = $_.PSChildName
-        DisplayName          = $dn.Value
-        DisplayVersion       = $_.PSObject.Properties['DisplayVersion']?.Value
-        Publisher            = $_.PSObject.Properties['Publisher']?.Value
-        UninstallString      = $_.PSObject.Properties['UninstallString']?.Value
-        QuietUninstallString = $_.PSObject.Properties['QuietUninstallString']?.Value
-        InstallLocation      = $_.PSObject.Properties['InstallLocation']?.Value
-        WindowsInstaller     = $_.PSObject.Properties['WindowsInstaller']?.Value
+        DisplayName          = [string]$dnProp.Value
+        DisplayVersion       = (& $get $_ "DisplayVersion")
+        Publisher            = (& $get $_ "Publisher")
+        UninstallString      = (& $get $_ "UninstallString")
+        QuietUninstallString = (& $get $_ "QuietUninstallString")
+        InstallLocation      = (& $get $_ "InstallLocation")
+        WindowsInstaller     = (& $get $_ "WindowsInstaller")
       }
     }
   }
+
+  # IMPORTANT: return an array, sorted, so your diff logic works consistently
+  return @($items | Sort-Object KeyName, DisplayName)
 }
+
 
 
 

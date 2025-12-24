@@ -7,7 +7,7 @@ FameInstaller - install_v1.ps1 (FINAL)
 - Cache + validation (detects HTML/partial downloads; re-downloads once)
 - Tracks uninstall info to C:\ProgramData\FameInstaller\state\<Org>\installed.json
 - Handles reboot-required exit codes (3010/1641) and can auto-resume after reboot (Scheduled Task)
-- PP14Downloader: opens UI installer and waits for user to finish (per your request)
+- UI-required: PP14Downloader + Adobe Reader installer (per request)
 #>
 
 [CmdletBinding()]
@@ -150,18 +150,15 @@ function Wait-For-InstallerIdle {
 function Get-RemoteInstallFiles {
   param([Parameter(Mandatory=$true)][string]$BaseUrl)
 
-  # PS 5.1 safe interpolation for ?get=basic
   $basicUrl = if ($BaseUrl.EndsWith("/")) { "$($BaseUrl)?get=basic" } else { "$($BaseUrl)/?get=basic" }
 
   Write-Log "Fetching file list: $basicUrl"
   $html = (Invoke-WebRequest -Uri $basicUrl -UseBasicParsing).Content
 
-  # hrefs (double + single quotes)
   $hrefs = @()
   $hrefs += [regex]::Matches($html, 'href="([^"]+)"', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }
   $hrefs += [regex]::Matches($html, "href='([^']+)'",  'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }
 
-  # plain filenames in content
   $plain = [regex]::Matches($html, '(?i)[A-Za-z0-9][A-Za-z0-9 _\-\.\(\)%]*\.(exe|msi)') |
            ForEach-Object { $_.Value }
 
@@ -242,7 +239,7 @@ function Test-IsValidMsi {
 
   try {
     $wi = New-Object -ComObject WindowsInstaller.Installer
-    $db = $wi.OpenDatabase($MsiPath, 0)  # read-only
+    $db = $wi.OpenDatabase($MsiPath, 0)
     $null = $db.SummaryInformation
     return $true
   } catch {
@@ -271,16 +268,8 @@ function Get-MsiProductCodeFromPackage {
 function Test-MsiInstalledByProductCode {
   param([Parameter(Mandatory=$true)][string]$ProductCode)
 
-  try {
-    $null = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{$ProductCode}" -ErrorAction Stop
-    return $true
-  } catch { }
-
-  try {
-    $null = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{$ProductCode}" -ErrorAction Stop
-    return $true
-  } catch { }
-
+  try { $null = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{$ProductCode}" -ErrorAction Stop; return $true } catch {}
+  try { $null = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{$ProductCode}" -ErrorAction Stop; return $true } catch {}
   return $false
 }
 
@@ -309,7 +298,6 @@ function Get-ExeArgCandidates {
     [Parameter(Mandatory=$true)][string]$Signature
   )
 
-  # Known overrides
   if ($FileName -match '^NetFx64\.exe$') { return @("/q /norestart", "/quiet /norestart") }
   if ($FileName -match '^Reader_.*\.exe$') { return @("/sAll /rs /rps /msi EULA_ACCEPT=YES", "/quiet /norestart", "/S") }
   if ($FileName -match '^Splashtop_Streamer_.*\.exe$') { return @("/quiet /norestart", "/silent", "/S", "/verysilent /norestart") }
@@ -389,9 +377,7 @@ function Load-State {
         $s | Add-Member -NotePropertyName "items" -NotePropertyValue @() -Force | Out-Null
       }
       return $s
-    } catch {
-      # fall through to new state
-    }
+    } catch { }
   }
 
   return [pscustomobject]@{
@@ -445,10 +431,7 @@ function Register-ResumeTask {
   $trigger = New-ScheduledTaskTrigger -AtStartup
   $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
 
-  try {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-  } catch {}
-
+  try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
   Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
   Write-Log "Registered resume task: $taskName" "OK"
 }
@@ -472,13 +455,10 @@ function Invoke-MsiInstall {
     [int]$Retries = 3
   )
 
-  # Normalize product code to a single string
   $pc = $null
   if ($ProductCode) { $pc = [string]($ProductCode | Select-Object -First 1) }
 
-  if (-not (Test-IsValidMsi -MsiPath $Path)) {
-    return 1620
-  }
+  if (-not (Test-IsValidMsi -MsiPath $Path)) { return 1620 }
 
   if ($pc) {
     try {
@@ -506,7 +486,6 @@ function Invoke-MsiInstall {
       Start-Sleep -Seconds (5 * $i)
       continue
     }
-
     return $code
   }
 
@@ -569,11 +548,12 @@ function Invoke-UiExeAndWait {
 
   if ($DownloadOnly) { Write-Log "DownloadOnly: skipping UI execution" "WARN"; return 0 }
 
-  # IMPORTANT: do not force silent args; show UI and let user finish.
   $p = Start-Process -FilePath $Path -PassThru
   $p.WaitForExit()
 
   $code = [int]$p.ExitCode
+  Write-Log "UI installer exit code: $code ($fileName)" "INFO"
+
   if ($code -eq 0) { return 0 }
   if ($code -eq 3010 -or $code -eq 1641) { $script:RebootRequired = $true; return $code }
 
@@ -614,9 +594,10 @@ try {
   Set-StateProp -State $state -Name "lastStart" -Value (Get-Date).ToString("o")
   Save-State $state
 
-  # PP14Downloader must show UI and wait
+  # UI installers (ADD READER HERE ✅)
   $uiExeList = @(
-    "PP14Downloader_1_0_35_0.EXE"
+    "PP14Downloader_1_0_35_0.EXE",
+    "Reader_en_install (2).exe"
   )
 
   foreach ($f in $plan) {
@@ -685,7 +666,6 @@ try {
           Select-Object KeyName, DisplayName, DisplayVersion, Publisher, UninstallString, QuietUninstallString, WindowsInstaller
       )
 
-      # Append record safely
       $items = @()
       if ($state.PSObject.Properties.Match("items").Count -gt 0) { $items = @($state.items) }
       $items += [pscustomobject]$record
@@ -707,7 +687,6 @@ try {
     } catch {
       Write-Log "FAILED: $f :: $($_.Exception.Message)" "ERROR"
 
-      # Record failure in state (best-effort)
       try {
         $failRec = [pscustomobject]@{
           file        = $f
@@ -726,7 +705,6 @@ try {
     }
   }
 
-  # If reboot required: schedule resume, set state, reboot
   if ($script:RebootRequired -and -not $DownloadOnly) {
     Write-Log "Reboot required detected. Scheduling auto-resume after reboot..." "WARN"
     Register-ResumeTask -ScriptPath $PSCommandPath -OrgName $Org
@@ -741,7 +719,6 @@ try {
     exit 0
   }
 
-  # Success
   Unregister-ResumeTask -OrgName $Org
 
   Set-StateProp -State $state -Name "status" -Value "success"

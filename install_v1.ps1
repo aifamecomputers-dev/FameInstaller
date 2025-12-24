@@ -26,9 +26,12 @@ $LogFile   = Join-Path $LogDir ("install_{0}_{1}.log" -f $Org, $Stamp)
 $StateFile = Join-Path $StateDir "installed.json"
 
 function Write-Log {
-  param([string]$Message, [ValidateSet("INFO","WARN","ERROR","OK")] [string]$Level="INFO")
+  param(
+    [string]$Message,
+    [ValidateSet("INFO","WARN","ERROR","OK")] [string]$Level="INFO"
+  )
   $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-  $line | Tee-Object -FilePath $LogFile -Append
+  $line | Tee-Object -FilePath $LogFile -Append | Out-Null   # <- prevent pipeline output
 }
 
 function Ensure-Admin {
@@ -238,37 +241,45 @@ function Get-ExeArgCandidates {
 
 function Invoke-MsiInstall {
   param([string]$Path)
+
   Wait-For-InstallerIdle
   $args = "/i `"$Path`" /qn /norestart"
   Write-Log "MSI: msiexec.exe $args"
   if ($DownloadOnly) { Write-Log "DownloadOnly: skipping execution" "WARN"; return 0 }
+
   $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
-  return $p.ExitCode
+  return [int]$p.ExitCode
 }
 
 function Invoke-ExeInstall {
   param([string]$Path)
+
   Wait-For-InstallerIdle
-  $fileName = Split-Path -Leaf $Path
-  $sig = Get-InstallerSignature -ExePath $Path
+  $fileName   = Split-Path -Leaf $Path
+  $sig        = Get-InstallerSignature -ExePath $Path
   $candidates = Get-ExeArgCandidates -FileName $fileName -Signature $sig | Select-Object -Unique
 
   foreach ($a in $candidates) {
     try {
       Write-Log "EXE: `"$fileName`" signature=$sig args=$a"
       if ($DownloadOnly) { Write-Log "DownloadOnly: skipping execution" "WARN"; return 0 }
-      $p = Start-Process -FilePath $Path -ArgumentList $a -Wait -PassThru
-      $code = $p.ExitCode
+
+      $p    = Start-Process -FilePath $Path -ArgumentList $a -Wait -PassThru
+      $code = [int]$p.ExitCode
+
       if ($code -eq 0 -or $code -eq 3010) { return $code }
       if ($code -eq 1618) { Write-Log "Exit 1618. Waiting then retry..." "WARN"; Wait-For-InstallerIdle; continue }
       if ($code -eq 1638) { Write-Log "Exit 1638 (already installed). Treating OK." "WARN"; return 0 }
+
       Write-Log "Attempt failed: exit=$code (args=$a)" "WARN"
     } catch {
       Write-Log "Attempt exception: $($_.Exception.Message) (args=$a)" "WARN"
     }
   }
+
   throw "All silent install attempts failed for: $fileName"
 }
+
 
 # ---- MSI product code capture (so uninstaller can be exact) ----
 function Get-MsiProductCodeFromPackage {

@@ -1,3 +1,15 @@
+<# 
+FameInstaller - install_v1.ps1 (FINAL)
+- Installs all EXE/MSI in https://file.famepbx.com/{org}/
+- Priority: NetFx64.exe first (if present), then MSIs, then other EXEs
+- Safe for Windows PowerShell 5.1 (no ternary, no null-conditional)
+- Single-run lock to prevent parallel runs
+- Cache + validation (detects HTML/partial downloads; re-downloads once)
+- Tracks uninstall info to C:\ProgramData\FameInstaller\state\<Org>\installed.json
+- Handles reboot-required exit codes (3010/1641) and can auto-resume after reboot (Scheduled Task)
+- PP14Downloader: opens UI installer and waits for user to finish (per your request)
+#>
+
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)]
@@ -7,7 +19,11 @@ param(
   [switch]$ContinueOnError,
   [switch]$DownloadOnly,
 
-  # internal (used by scheduled task resume)
+  # Optional override to bypass DNS/hairpin issues:
+  # e.g. -BaseUrlOverride "https://192.168.50.10/amax/"
+  [string]$BaseUrlOverride,
+
+  # Internal flag used by resume task
   [switch]$Resumed
 )
 
@@ -16,12 +32,15 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ----------------------------
-# Paths / Logging / State
+# Globals / Paths / Logging / State / Lock
 # ----------------------------
-$BaseRoot  = "C:\ProgramData\FameInstaller"
-$LogDir    = Join-Path $BaseRoot "logs"
-$CacheDir  = Join-Path $BaseRoot ("cache\{0}" -f $Org)
-$StateDir  = Join-Path $BaseRoot ("state\{0}" -f $Org)
+$script:RebootRequired = $false
+
+$BaseRoot = "C:\ProgramData\FameInstaller"
+$LogDir   = Join-Path $BaseRoot "logs"
+$CacheDir = Join-Path $BaseRoot ("cache\{0}" -f $Org)
+$StateDir = Join-Path $BaseRoot ("state\{0}" -f $Org)
+
 New-Item -ItemType Directory -Force -Path $LogDir, $CacheDir, $StateDir | Out-Null
 
 $Stamp     = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -29,21 +48,17 @@ $LogFile   = Join-Path $LogDir ("install_{0}_{1}.log" -f $Org, $Stamp)
 $StateFile = Join-Path $StateDir "installed.json"
 $LockFile  = Join-Path $StateDir "install.lock"
 
-# scheduled task name for resume
-$TaskName  = "FameInstaller-Resume-$Org"
-
-# reboot flag
-$script:RebootRequired = $false
-
+# -------- Logging --------
 function Write-Log {
   param(
-    [string]$Message,
+    [Parameter(Mandatory=$true)][string]$Message,
     [ValidateSet("INFO","WARN","ERROR","OK")] [string]$Level="INFO"
   )
   $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
   $line | Tee-Object -FilePath $LogFile -Append | Out-Null
 }
 
+# -------- Admin elevation --------
 function Ensure-Admin {
   $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
             ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -53,6 +68,7 @@ function Ensure-Admin {
     $args = @("-NoProfile","-ExecutionPolicy","Bypass","-File","`"$PSCommandPath`"","-Org",$Org)
     if ($ContinueOnError) { $args += "-ContinueOnError" }
     if ($DownloadOnly)    { $args += "-DownloadOnly" }
+    if ($BaseUrlOverride) { $args += @("-BaseUrlOverride",$BaseUrlOverride) }
     if ($Resumed)         { $args += "-Resumed" }
 
     Start-Process -FilePath "powershell.exe" -ArgumentList $args -Verb RunAs | Out-Null
@@ -60,31 +76,61 @@ function Ensure-Admin {
   }
 }
 
+# -------- Locking (prevents parallel runs) --------
 function Acquire-Lock {
-  # prevent two installers running at same time
-  try {
-    if (Test-Path $LockFile) {
-      $age = (Get-Item $LockFile).LastWriteTime
-      # if lock older than 6 hours, treat as stale
-      if ($age -lt (Get-Date).AddHours(-6)) {
-        Write-Log "Stale lock detected, clearing: $LockFile" "WARN"
-        Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
-      } else {
-        throw "Another FameInstaller run seems active (lock exists): $LockFile"
-      }
+  $staleHours = 2
+
+  if (Test-Path $LockFile) {
+    $pidAlive = $false
+    $lockAgeOk = $true
+
+    try {
+      $age = (Get-Item $LockFile -ErrorAction Stop).LastWriteTime
+      if ($age -lt (Get-Date).AddHours(-$staleHours)) { $lockAgeOk = $false }
+    } catch {
+      $lockAgeOk = $false
     }
-    Set-Content -Path $LockFile -Value ("{0} {1}" -f $env:COMPUTERNAME, (Get-Date).ToString("o")) -Encoding UTF8
-  } catch { throw }
+
+    $lock = $null
+    try {
+      $raw = Get-Content $LockFile -Raw -ErrorAction SilentlyContinue
+      if ($raw) { $lock = $raw | ConvertFrom-Json -ErrorAction SilentlyContinue }
+    } catch { $lock = $null }
+
+    if ($lock -and $lock.pid) {
+      try {
+        $pidAlive = @(Get-Process -Id ([int]$lock.pid) -ErrorAction SilentlyContinue).Count -gt 0
+      } catch { $pidAlive = $false }
+    }
+
+    if ($pidAlive -and $lockAgeOk) {
+      throw "Another FameInstaller run seems active (PID=$($lock.pid)). Lock: $LockFile"
+    }
+
+    Write-Log "Clearing stale lock (pidAlive=$pidAlive, lockAgeOk=$lockAgeOk): $LockFile" "WARN"
+    Remove-Item $LockFile -Force -ErrorAction SilentlyContinue | Out-Null
+  }
+
+  $obj = [pscustomobject]@{
+    computer = $env:COMPUTERNAME
+    pid      = $PID
+    created  = (Get-Date).ToString("o")
+  }
+  $obj | ConvertTo-Json | Set-Content -Path $LockFile -Encoding UTF8
 }
 
 function Release-Lock {
-  Remove-Item $LockFile -Force -ErrorAction SilentlyContinue | Out-Null
+  try {
+    if (Test-Path $LockFile) { Remove-Item $LockFile -Force -ErrorAction SilentlyContinue | Out-Null }
+  } catch {}
 }
 
+# -------- Installer busy wait --------
 function Wait-For-InstallerIdle {
   param([int]$MaxMinutes = 45, [int]$PollSeconds = 10)
 
   $deadline = (Get-Date).AddMinutes($MaxMinutes)
+
   while ($true) {
     $msi = Get-Process -Name "msiexec" -ErrorAction SilentlyContinue
     if (-not $msi) { return }
@@ -98,18 +144,24 @@ function Wait-For-InstallerIdle {
   }
 }
 
+# ----------------------------
+# Web + Download helpers
+# ----------------------------
 function Get-RemoteInstallFiles {
   param([Parameter(Mandatory=$true)][string]$BaseUrl)
 
+  # PS 5.1 safe interpolation for ?get=basic
   $basicUrl = if ($BaseUrl.EndsWith("/")) { "$($BaseUrl)?get=basic" } else { "$($BaseUrl)/?get=basic" }
 
   Write-Log "Fetching file list: $basicUrl"
   $html = (Invoke-WebRequest -Uri $basicUrl -UseBasicParsing).Content
 
+  # hrefs (double + single quotes)
   $hrefs = @()
   $hrefs += [regex]::Matches($html, 'href="([^"]+)"', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }
   $hrefs += [regex]::Matches($html, "href='([^']+)'",  'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }
 
+  # plain filenames in content
   $plain = [regex]::Matches($html, '(?i)[A-Za-z0-9][A-Za-z0-9 _\-\.\(\)%]*\.(exe|msi)') |
            ForEach-Object { $_.Value }
 
@@ -130,26 +182,30 @@ function Get-RemoteInstallFiles {
     } |
     Select-Object -Unique
 
-  if (-not $files -or $files.Count -eq 0) {
-    throw "No .exe/.msi installers found at $basicUrl"
-  }
-
+  if (-not $files -or $files.Count -eq 0) { throw "No .exe/.msi installers found at $basicUrl" }
   return $files
 }
 
 function Test-IsHtmlFile {
   param([Parameter(Mandatory=$true)][string]$Path)
+
   $fs = [System.IO.File]::Open($Path,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite)
   try {
     $buf = New-Object byte[] 2048
     $n = $fs.Read($buf,0,$buf.Length)
     $txt = [System.Text.Encoding]::ASCII.GetString($buf,0,$n)
     return ($txt -match '<!DOCTYPE html>|<html')
-  } finally { $fs.Close() }
+  } finally {
+    $fs.Close()
+  }
 }
 
 function Download-File {
-  param([string]$Url, [string]$OutPath, [int]$Retries = 4)
+  param(
+    [Parameter(Mandatory=$true)][string]$Url,
+    [Parameter(Mandatory=$true)][string]$OutPath,
+    [int]$Retries = 4
+  )
 
   if (Test-Path $OutPath) { Write-Log "Cache hit: $OutPath"; return }
 
@@ -157,12 +213,12 @@ function Download-File {
     try {
       Write-Log "Downloading ($i/$Retries): $Url"
       Invoke-WebRequest -Uri $Url -OutFile $OutPath -UseBasicParsing -Headers @{ "Cache-Control"="no-cache" }
-
       if (-not (Test-Path $OutPath)) { throw "Download failed (file not created)." }
+
       try { Unblock-File -Path $OutPath -ErrorAction SilentlyContinue } catch {}
 
       if (Test-IsHtmlFile -Path $OutPath) {
-        throw "Downloaded HTML instead of installer. URL blocked/WAF/auth issue: $Url"
+        throw "Downloaded HTML instead of installer (blocked/403/404). URL: $Url"
       }
 
       Write-Log "Download OK: $OutPath" "OK"
@@ -175,11 +231,18 @@ function Download-File {
   }
 }
 
+# ----------------------------
+# MSI helpers
+# ----------------------------
 function Test-IsValidMsi {
   param([Parameter(Mandatory=$true)][string]$MsiPath)
+
+  if (-not (Test-Path $MsiPath)) { return $false }
+  if (Test-IsHtmlFile -Path $MsiPath) { return $false }
+
   try {
     $wi = New-Object -ComObject WindowsInstaller.Installer
-    $db = $wi.OpenDatabase($MsiPath, 0)  # will throw if not a valid MSI
+    $db = $wi.OpenDatabase($MsiPath, 0)  # read-only
     $null = $db.SummaryInformation
     return $true
   } catch {
@@ -188,31 +251,81 @@ function Test-IsValidMsi {
 }
 
 function Get-MsiProductCodeFromPackage {
-  param([string]$MsiPath)
+  param([Parameter(Mandatory=$true)][string]$MsiPath)
+
   try {
     $wi = New-Object -ComObject WindowsInstaller.Installer
     $db = $wi.OpenDatabase($MsiPath, 0)
     $view = $db.OpenView("SELECT `Value` FROM `Property` WHERE `Property`='ProductCode'")
     $view.Execute()
     $rec = $view.Fetch()
-    $code = $rec.StringData(1)
+    $code = $null
+    if ($rec) { $code = $rec.StringData(1) }
     $view.Close()
     return $code
-  } catch { return $null }
+  } catch {
+    return $null
+  }
 }
 
 function Test-MsiInstalledByProductCode {
-  param([string]$ProductCode)
-  if (-not $ProductCode) { return $false }
+  param([Parameter(Mandatory=$true)][string]$ProductCode)
 
-  $keys = @(
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\$ProductCode"
-  )
-  foreach ($k in $keys) { if (Test-Path $k) { return $true } }
+  try {
+    $null = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{$ProductCode}" -ErrorAction Stop
+    return $true
+  } catch { }
+
+  try {
+    $null = Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{$ProductCode}" -ErrorAction Stop
+    return $true
+  } catch { }
+
   return $false
 }
 
+# ----------------------------
+# EXE signature + args (best-effort)
+# ----------------------------
+function Get-InstallerSignature {
+  param([Parameter(Mandatory=$true)][string]$ExePath)
+
+  $max = 8MB
+  $bytes = [System.IO.File]::ReadAllBytes($ExePath)
+  if ($bytes.Length -gt $max) { $bytes = $bytes[0..($max-1)] }
+  $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+
+  if ($text -match 'Inno Setup') { return "INNO" }
+  if ($text -match 'Nullsoft Install System|NSIS') { return "NSIS" }
+  if ($text -match 'InstallShield') { return "IS" }
+  if ($text -match 'WiX Toolset') { return "WIX" }
+
+  return "UNKNOWN"
+}
+
+function Get-ExeArgCandidates {
+  param(
+    [Parameter(Mandatory=$true)][string]$FileName,
+    [Parameter(Mandatory=$true)][string]$Signature
+  )
+
+  # Known overrides
+  if ($FileName -match '^NetFx64\.exe$') { return @("/q /norestart", "/quiet /norestart") }
+  if ($FileName -match '^Reader_.*\.exe$') { return @("/sAll /rs /rps /msi EULA_ACCEPT=YES", "/quiet /norestart", "/S") }
+  if ($FileName -match '^Splashtop_Streamer_.*\.exe$') { return @("/quiet /norestart", "/silent", "/S", "/verysilent /norestart") }
+
+  switch ($Signature) {
+    "INNO" { return @("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-", "/SILENT /NORESTART /SP-") }
+    "NSIS" { return @("/S") }
+    "IS"   { return @("/s /v`"/qn /norestart`"", "/s") }
+    "WIX"  { return @("/quiet /norestart", "/q") }
+    default { return @("/quiet /norestart","/q /norestart","/S","/silent","/verysilent /norestart","/s /v`"/qn /norestart`"") }
+  }
+}
+
+# ----------------------------
+# Uninstall registry snapshot (for EXE tracking)
+# ----------------------------
 function Get-UninstallRegistrySnapshot {
   $paths = @(
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -248,7 +361,10 @@ function Get-UninstallRegistrySnapshot {
 }
 
 function Find-NewUninstallEntries {
-  param([object[]]$Before,[object[]]$After)
+  param(
+    [Parameter(Mandatory=$true)][object[]]$Before,
+    [Parameter(Mandatory=$true)][object[]]$After
+  )
 
   $beforeIds = New-Object System.Collections.Generic.HashSet[string]
   foreach ($b in $Before) { [void]$beforeIds.Add("$($b.KeyName)|$($b.DisplayName)") }
@@ -261,53 +377,116 @@ function Find-NewUninstallEntries {
   return $new
 }
 
-function Get-InstallerSignature {
-  param([string]$ExePath)
+# ----------------------------
+# State handling (StrictMode-safe)
+# ----------------------------
+function Load-State {
+  if (Test-Path $StateFile) {
+    try {
+      $s = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+      if (-not $s) { throw "Empty state" }
+      if ($s.PSObject.Properties.Match("items").Count -eq 0) {
+        $s | Add-Member -NotePropertyName "items" -NotePropertyValue @() -Force | Out-Null
+      }
+      return $s
+    } catch {
+      # fall through to new state
+    }
+  }
 
-  # keep this lightweight, don't read whole file
-  $max = 8MB
-  $bytes = [System.IO.File]::ReadAllBytes($ExePath)
-  if ($bytes.Length -gt $max) { $bytes = $bytes[0..($max-1)] }
-  $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-
-  if ($text -match 'Inno Setup') { return "INNO" }
-  if ($text -match 'Nullsoft Install System|NSIS') { return "NSIS" }
-  if ($text -match 'InstallShield') { return "IS" }
-  if ($text -match 'WiX Toolset') { return "WIX" }
-  return "UNKNOWN"
-}
-
-function Get-ExeArgCandidates {
-  param([string]$FileName,[string]$Signature)
-
-  # Special cases
-  if ($FileName -match '^NetFx64\.exe$') { return @("/q /norestart", "/quiet /norestart", "/passive /norestart") }
-  if ($FileName -match '^Reader_.*\.exe$') { return @("/sAll /rs /rps /msi EULA_ACCEPT=YES", "/S", "/quiet /norestart") }
-  if ($FileName -match '^Splashtop_Streamer_.*\.exe$') { return @("/quiet /norestart", "/silent", "/S", "/verysilent /norestart") }
-
-  switch ($Signature) {
-    "INNO" { return @("/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-", "/SILENT /NORESTART /SP-") }
-    "NSIS" { return @("/S") }
-    "IS"   { return @("/s /v`"/qn /norestart`"", "/s") }
-    "WIX"  { return @("/quiet /norestart", "/q") }
-    default { return @("/quiet /norestart","/q /norestart","/S","/silent","/verysilent /norestart","/s /v`"/qn /norestart`"") }
+  return [pscustomobject]@{
+    org       = $Org
+    created   = (Get-Date).ToString("o")
+    resumed   = [bool]$Resumed
+    status    = "running"
+    items     = @()
   }
 }
 
+function Save-State($state) {
+  $state | ConvertTo-Json -Depth 20 | Set-Content -Path $StateFile -Encoding UTF8
+}
+
+function Set-StateProp {
+  param(
+    [Parameter(Mandatory=$true)]$State,
+    [Parameter(Mandatory=$true)][string]$Name,
+    [Parameter(Mandatory=$true)]$Value
+  )
+  if ($State.PSObject.Properties.Match($Name).Count -eq 0) {
+    $State | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force | Out-Null
+  } else {
+    $State.$Name = $Value
+  }
+}
+
+# ----------------------------
+# Resume-after-reboot (Scheduled Task)
+# ----------------------------
+function Register-ResumeTask {
+  param(
+    [Parameter(Mandatory=$true)][string]$ScriptPath,
+    [Parameter(Mandatory=$true)][string]$OrgName
+  )
+
+  $taskName = "FameInstaller-Resume-$OrgName"
+  $actionArgs = @(
+    "-NoProfile",
+    "-ExecutionPolicy","Bypass",
+    "-File","`"$ScriptPath`"",
+    "-Org",$OrgName,
+    "-Resumed"
+  )
+  if ($ContinueOnError) { $actionArgs += "-ContinueOnError" }
+  if ($DownloadOnly)    { $actionArgs += "-DownloadOnly" }
+  if ($BaseUrlOverride) { $actionArgs += @("-BaseUrlOverride",$BaseUrlOverride) }
+
+  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ($actionArgs -join " ")
+  $trigger = New-ScheduledTaskTrigger -AtStartup
+  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+
+  try {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+  } catch {}
+
+  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+  Write-Log "Registered resume task: $taskName" "OK"
+}
+
+function Unregister-ResumeTask {
+  param([Parameter(Mandatory=$true)][string]$OrgName)
+  $taskName = "FameInstaller-Resume-$OrgName"
+  try {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Write-Log "Removed resume task: $taskName" "OK"
+  } catch {}
+}
+
+# ----------------------------
+# Install executors
+# ----------------------------
 function Invoke-MsiInstall {
   param(
     [Parameter(Mandatory=$true)][string]$Path,
-    [string]$ProductCode = $null,
+    [object]$ProductCode = $null,
     [int]$Retries = 3
   )
+
+  # Normalize product code to a single string
+  $pc = $null
+  if ($ProductCode) { $pc = [string]($ProductCode | Select-Object -First 1) }
 
   if (-not (Test-IsValidMsi -MsiPath $Path)) {
     return 1620
   }
 
-  if ($ProductCode -and (Test-MsiInstalledByProductCode -ProductCode $ProductCode)) {
-    Write-Log "MSI already installed (ProductCode=$ProductCode). Skipping: $Path" "OK"
-    return 0
+  if ($pc) {
+    try {
+      if (Test-MsiInstalledByProductCode -ProductCode $pc) {
+        Write-Log "MSI already installed (ProductCode=$pc). Skipping: $Path" "OK"
+        return 0
+      }
+    } catch { }
   }
 
   Wait-For-InstallerIdle
@@ -327,6 +506,7 @@ function Invoke-MsiInstall {
       Start-Sleep -Seconds (5 * $i)
       continue
     }
+
     return $code
   }
 
@@ -334,14 +514,16 @@ function Invoke-MsiInstall {
 }
 
 function Invoke-ExeInstall {
-  param([string]$Path)
+  param([Parameter(Mandatory=$true)][string]$Path)
 
   Wait-For-InstallerIdle
-  $fileName   = Split-Path -Leaf $Path
-  $sig        = Get-InstallerSignature -ExePath $Path
-  $candidates = Get-ExeArgCandidates -FileName $fileName -Signature $sig | Select-Object -Unique
 
-  $timeoutMinutes = if ($fileName -ieq "NetFx64.exe") { 40 } else { 25 }
+  $fileName = Split-Path -Leaf $Path
+  $sig = Get-InstallerSignature -ExePath $Path
+  $candidates = @(Get-ExeArgCandidates -FileName $fileName -Signature $sig | Select-Object -Unique)
+
+  $timeoutMinutes = 25
+  if ($fileName -ieq "NetFx64.exe") { $timeoutMinutes = 40 }
 
   foreach ($a in $candidates) {
     try {
@@ -355,7 +537,7 @@ function Invoke-ExeInstall {
         if ((Get-Date) -gt $deadline) {
           Write-Log "Timeout waiting for $fileName. Killing PID=$($p.Id)..." "ERROR"
           try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
-          throw "Timeout installing $fileName (possible UI/SmartScreen block or hung installer)."
+          throw "Timeout installing $fileName (hung UI/SmartScreen)."
         }
         Start-Sleep -Seconds 5
         try { $p.Refresh() } catch {}
@@ -377,59 +559,25 @@ function Invoke-ExeInstall {
   throw "All silent install attempts failed for: $fileName"
 }
 
-function Load-State {
-  if (Test-Path $StateFile) {
-    try { return (Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { }
-  }
-  return [pscustomobject]@{
-    org=$Org
-    created=(Get-Date).ToString("o")
-    items=@()
-    completed=$false
-  }
-}
+function Invoke-UiExeAndWait {
+  param([Parameter(Mandatory=$true)][string]$Path)
 
-function Save-State($state) {
-  $state | ConvertTo-Json -Depth 12 | Set-Content -Path $StateFile -Encoding UTF8
-}
+  Wait-For-InstallerIdle
 
-function Test-AlreadyInstalledByState {
-  param([object]$state, [string]$fileName)
-  foreach ($it in $state.items) {
-    if ($it.file -eq $fileName -and [int]$it.exitCode -in @(0,3010,1641,1638)) { return $true }
-  }
-  return $false
-}
+  $fileName = Split-Path -Leaf $Path
+  Write-Log "UI installer required. Launching and waiting for user: $fileName" "WARN"
 
-function Ensure-ResumeTask {
-  param([string]$ScriptPath)
+  if ($DownloadOnly) { Write-Log "DownloadOnly: skipping UI execution" "WARN"; return 0 }
 
-  # create/replace a scheduled task that runs once at startup
-  $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-  $argList = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`" -Org $Org"
-  if ($ContinueOnError) { $argList += " -ContinueOnError" }
-  if ($DownloadOnly)    { $argList += " -DownloadOnly" }
-  $argList += " -Resumed"
+  # IMPORTANT: do not force silent args; show UI and let user finish.
+  $p = Start-Process -FilePath $Path -PassThru
+  $p.WaitForExit()
 
-  $action  = New-ScheduledTaskAction -Execute $ps -Argument $argList
-  $trigger = New-ScheduledTaskTrigger -AtStartup
+  $code = [int]$p.ExitCode
+  if ($code -eq 0) { return 0 }
+  if ($code -eq 3010 -or $code -eq 1641) { $script:RebootRequired = $true; return $code }
 
-  # Run as SYSTEM for reliability after reboot
-  $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -RunLevel Highest
-
-  try {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-  } catch {}
-
-  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal | Out-Null
-  Write-Log "Resume task created: $TaskName" "OK"
-}
-
-function Remove-ResumeTask {
-  try {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-    Write-Log "Resume task removed: $TaskName" "OK"
-  } catch {}
+  return $code
 }
 
 # ----------------------------
@@ -439,9 +587,15 @@ try {
   Ensure-Admin
   Acquire-Lock
 
-  Write-Log "==== Fame Folder Installer start | Org=$Org | Host=$env:COMPUTERNAME | Resumed=$Resumed ===="
+  Write-Log ("==== Fame Folder Installer start | Org={0} | Host={1} | Resumed={2} ====" -f $Org, $env:COMPUTERNAME, ([bool]$Resumed))
 
-  $baseUrl = if ($Org -eq "Alpa") { "https://file.famepbx.com/alpa/" } else { "https://file.famepbx.com/amax/" }
+  $baseUrl = $null
+  if ($BaseUrlOverride) {
+    $baseUrl = $BaseUrlOverride
+  } else {
+    if ($Org -eq "Alpa") { $baseUrl = "https://file.famepbx.com/alpa/" } else { $baseUrl = "https://file.famepbx.com/amax/" }
+  }
+
   $files = Get-RemoteInstallFiles -BaseUrl $baseUrl
 
   $dotnet = $files | Where-Object { $_ -ieq "NetFx64.exe" }
@@ -456,43 +610,68 @@ try {
   Write-Log ("Install plan ({0} items): {1}" -f $plan.Count, ($plan -join ", "))
 
   $state = Load-State
+  Set-StateProp -State $state -Name "status" -Value "running"
+  Set-StateProp -State $state -Name "lastStart" -Value (Get-Date).ToString("o")
+  Save-State $state
+
+  # PP14Downloader must show UI and wait
+  $uiExeList = @(
+    "PP14Downloader_1_0_35_0.EXE"
+  )
 
   foreach ($f in $plan) {
     try {
-      # Skip already-done items (resume safe)
-      if (Test-AlreadyInstalledByState -state $state -fileName $f) {
-        Write-Log "Already completed earlier. Skipping: $f" "OK"
-        continue
-      }
-
       $url   = $baseUrl.TrimEnd("/") + "/" + [uri]::EscapeDataString($f).Replace("+","%20")
       $local = Join-Path $CacheDir $f
+
       Download-File -Url $url -OutPath $local
 
-      # extra safety: validate non-html after download
-      if (Test-IsHtmlFile -Path $local) { throw "Downloaded HTML instead of installer: $f" }
+      # For MSIs: validate; if invalid cached, delete + re-download once
+      if ($f -match '(?i)\.msi$') {
+        if (-not (Test-IsValidMsi -MsiPath $local)) {
+          Write-Log "Cached MSI invalid. Deleting + re-downloading: $f" "WARN"
+          Remove-Item $local -Force -ErrorAction SilentlyContinue | Out-Null
+          Download-File -Url $url -OutPath $local
+          if (-not (Test-IsValidMsi -MsiPath $local)) {
+            throw "MSI invalid/unopenable (1620). Likely bad package or blocked download."
+          }
+        }
+      }
 
       $before = Get-UninstallRegistrySnapshot
 
+      $exit = 0
       $pkgType = "exe"
       if ($f -match '(?i)\.msi$') { $pkgType = "msi" }
 
       $record = [ordered]@{
-        file = $f
-        local = $local
-        type = $pkgType
-        installedAt = (Get-Date).ToString("o")
-        exitCode = $null
-        msiProductCode = $null
+        file            = $f
+        local           = $local
+        type            = $pkgType
+        installedAt     = (Get-Date).ToString("o")
+        exitCode        = $null
+        msiProductCode  = $null
         uninstallEntries = @()
+        notes           = $null
       }
 
-      $exit = 0
-      if ($pkgType -eq "msi") {
-        $record.msiProductCode = Get-MsiProductCodeFromPackage -MsiPath $local
-        $exit = Invoke-MsiInstall -Path $local -ProductCode $record.msiProductCode
+      if ($f -match '(?i)\.msi$') {
+        $pc = Get-MsiProductCodeFromPackage -MsiPath $local
+        if ($pc) { $pc = [string]($pc | Select-Object -First 1) } else { $pc = $null }
+        $record.msiProductCode = $pc
+        $exit = Invoke-MsiInstall -Path $local -ProductCode $pc
+
+        if ($exit -eq 1620) {
+          throw "MSI invalid/unopenable (1620). Likely bad package or blocked download."
+        }
+
       } else {
-        $exit = Invoke-ExeInstall -Path $local
+        if ($uiExeList -contains $f) {
+          $record.notes = "UI-required"
+          $exit = Invoke-UiExeAndWait -Path $local
+        } else {
+          $exit = Invoke-ExeInstall -Path $local
+        }
       }
 
       $record.exitCode = [int]$exit
@@ -506,51 +685,86 @@ try {
           Select-Object KeyName, DisplayName, DisplayVersion, Publisher, UninstallString, QuietUninstallString, WindowsInstaller
       )
 
-      $state.items += [pscustomobject]$record
+      # Append record safely
+      $items = @()
+      if ($state.PSObject.Properties.Match("items").Count -gt 0) { $items = @($state.items) }
+      $items += [pscustomobject]$record
+      Set-StateProp -State $state -Name "items" -Value $items
+      Set-StateProp -State $state -Name "lastItem" -Value $f
+      Set-StateProp -State $state -Name "lastUpdate" -Value (Get-Date).ToString("o")
       Save-State $state
 
-      $exitNum = [int]$exit
-      if ($exitNum -eq 0 -or $exitNum -eq 1638) {
+      if ($exit -eq 0) {
         Write-Log "Installed OK: $f" "OK"
-      } elseif ($exitNum -eq 3010 -or $exitNum -eq 1641) {
+      } elseif ($exit -eq 3010 -or $exit -eq 1641) {
         Write-Log "Installed OK (reboot required): $f" "WARN"
-      } elseif ($exitNum -eq 1620) {
-        throw "MSI invalid/unopenable (1620). Likely bad package or blocked download."
+      } elseif ($exit -eq 1638) {
+        Write-Log "Already installed: $f" "WARN"
       } else {
-        throw "Installer returned exit code $exitNum"
-      }
-
-      # Auto-reboot and resume if required
-      if ($script:RebootRequired -and -not $DownloadOnly) {
-        # Prepare resume task to continue after reboot
-        Ensure-ResumeTask -ScriptPath $PSCommandPath
-        Write-Log "Reboot required detected. Restarting now to continue installation..." "WARN"
-        Release-Lock
-        Restart-Computer -Force
-        exit 0
+        throw "Installer returned exit code $exit"
       }
 
     } catch {
       Write-Log "FAILED: $f :: $($_.Exception.Message)" "ERROR"
+
+      # Record failure in state (best-effort)
+      try {
+        $failRec = [pscustomobject]@{
+          file        = $f
+          failedAt    = (Get-Date).ToString("o")
+          message     = $_.Exception.Message
+        }
+        $fails = @()
+        if ($state.PSObject.Properties.Match("failures").Count -gt 0) { $fails = @($state.failures) }
+        $fails += $failRec
+        Set-StateProp -State $state -Name "failures" -Value $fails
+        Set-StateProp -State $state -Name "lastUpdate" -Value (Get-Date).ToString("o")
+        Save-State $state
+      } catch {}
+
       if (-not $ContinueOnError) { throw }
     }
   }
 
-  $state.completed = $true
-  Save-State $state
+  # If reboot required: schedule resume, set state, reboot
+  if ($script:RebootRequired -and -not $DownloadOnly) {
+    Write-Log "Reboot required detected. Scheduling auto-resume after reboot..." "WARN"
+    Register-ResumeTask -ScriptPath $PSCommandPath -OrgName $Org
 
-  # If we were resumed, remove the resume task when done
-  Remove-ResumeTask
+    Set-StateProp -State $state -Name "status" -Value "rebooting"
+    Set-StateProp -State $state -Name "rebootRequestedAt" -Value (Get-Date).ToString("o")
+    Save-State $state
+
+    Release-Lock
+    Write-Log "Rebooting now..." "WARN"
+    Restart-Computer -Force
+    exit 0
+  }
+
+  # Success
+  Unregister-ResumeTask -OrgName $Org
+
+  Set-StateProp -State $state -Name "status" -Value "success"
+  Set-StateProp -State $state -Name "completed" -Value (Get-Date).ToString("o")
+  Save-State $state
 
   Write-Log "State saved: $StateFile" "OK"
   Write-Log "==== Completed successfully. Log: $LogFile ====" "OK"
-
   Release-Lock
   exit 0
 }
 catch {
   Write-Log "FATAL: $($_.Exception.Message)" "ERROR"
   Write-Log "Log file: $LogFile" "ERROR"
+
+  try {
+    $state = Load-State
+    Set-StateProp -State $state -Name "status" -Value "fatal"
+    Set-StateProp -State $state -Name "fatalAt" -Value (Get-Date).ToString("o")
+    Set-StateProp -State $state -Name "fatalMessage" -Value $_.Exception.Message
+    Save-State $state
+  } catch {}
+
   Release-Lock
   exit 1
 }

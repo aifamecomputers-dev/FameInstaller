@@ -17,12 +17,12 @@ $ErrorActionPreference = "Stop"
 # ----------------------------
 $BaseRoot = "C:\ProgramData\FameInstaller"
 $LogDir   = Join-Path $BaseRoot "logs"
-$CacheDir = Join-Path $BaseRoot "cache\$Org"
-$StateDir = Join-Path $BaseRoot "state\$Org"
+$CacheDir = Join-Path $BaseRoot ("cache\{0}" -f $Org)
+$StateDir = Join-Path $BaseRoot ("state\{0}" -f $Org)
 New-Item -ItemType Directory -Force -Path $LogDir, $CacheDir, $StateDir | Out-Null
 
-$Stamp   = Get-Date -Format "yyyyMMdd_HHmmss"
-$LogFile = Join-Path $LogDir "install_$Org`_$Stamp.log"
+$Stamp     = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile   = Join-Path $LogDir ("install_{0}_{1}.log" -f $Org, $Stamp)
 $StateFile = Join-Path $StateDir "installed.json"
 
 function Write-Log {
@@ -58,10 +58,15 @@ function Wait-For-InstallerIdle {
 
 function Get-RemoteInstallFiles {
   param([Parameter(Mandatory=$true)][string]$BaseUrl)
-  $basicUrl = if ($BaseUrl.EndsWith("/")) { "$BaseUrl?get=basic" } else { "$BaseUrl/?get=basic" }
+
+  # PowerShell 5.1-safe interpolation: avoid "$BaseUrl?get=basic"
+  $basicUrl = if ($BaseUrl.EndsWith("/")) { "$($BaseUrl)?get=basic" } else { "$($BaseUrl)/?get=basic" }
+
   Write-Log "Fetching file list: $basicUrl"
   $html = (Invoke-WebRequest -Uri $basicUrl -UseBasicParsing).Content
+
   $hrefs = [regex]::Matches($html, 'href="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+
   $files = $hrefs |
     Where-Object { $_ -and ($_ -match '\.(exe|msi)$') } |
     ForEach-Object { [System.Uri]::UnescapeDataString($_) } |
@@ -71,18 +76,31 @@ function Get-RemoteInstallFiles {
       $_ -notmatch '^user\.config$'
     } |
     Select-Object -Unique
+
   if (-not $files -or $files.Count -eq 0) { throw "No .exe/.msi installers found at $basicUrl" }
   return $files
 }
 
 function Download-File {
   param([string]$Url, [string]$OutPath, [int]$Retries = 4)
+
   if (Test-Path $OutPath) { Write-Log "Cache hit: $OutPath"; return }
+
   for ($i=1; $i -le $Retries; $i++) {
     try {
       Write-Log "Downloading ($i/$Retries): $Url"
       Invoke-WebRequest -Uri $Url -OutFile $OutPath -UseBasicParsing -Headers @{ "Cache-Control"="no-cache" }
       if (-not (Test-Path $OutPath)) { throw "Download failed (file not created)." }
+
+      # Helpful: reduce SmartScreen/MOTW issues
+      try { Unblock-File -Path $OutPath -ErrorAction SilentlyContinue } catch {}
+
+      # Fail fast if we downloaded an HTML error page (WAF/403/404)
+      $head = Get-Content -Path $OutPath -TotalCount 2 -ErrorAction SilentlyContinue
+      if ($head -match '<!DOCTYPE html>|<html') {
+        throw "Downloaded HTML instead of installer. URL may be blocked or requires auth: $Url"
+      }
+
       Write-Log "Download OK: $OutPath" "OK"
       return
     } catch {
@@ -113,7 +131,6 @@ function Get-UninstallRegistrySnapshot {
       }
     }
   }
-  # Stable identity: KeyName + DisplayName
   return $items | Where-Object { $_.DisplayName } | Sort-Object KeyName, DisplayName
 }
 
@@ -149,6 +166,7 @@ function Get-InstallerSignature {
 
 function Get-ExeArgCandidates {
   param([string]$FileName, [string]$Signature)
+
   if ($FileName -match '^NetFx64\.exe$') { return @("/q /norestart", "/quiet /norestart") }
   if ($FileName -match '^Reader_.*\.exe$') { return @("/sAll /rs /rps /msi EULA_ACCEPT=YES", "/quiet /norestart", "/S") }
   if ($FileName -match '^Splashtop_Streamer_.*\.exe$') { return @("/quiet /norestart", "/silent", "/S", "/verysilent /norestart") }
@@ -250,7 +268,7 @@ try {
 
   foreach ($f in $plan) {
     try {
-      $url = $baseUrl.TrimEnd("/") + "/" + [uri]::EscapeDataString($f).Replace("+","%20")
+      $url   = $baseUrl.TrimEnd("/") + "/" + [uri]::EscapeDataString($f).Replace("+","%20")
       $local = Join-Path $CacheDir $f
       Download-File -Url $url -OutPath $local
 
@@ -261,7 +279,7 @@ try {
       $record = [ordered]@{
         file = $f
         local = $local
-        type = ($f -match '\.msi$') ? "msi" : "exe"
+        type = (if ($f -match '\.msi$') { "msi" } else { "exe" })   # PowerShell 5.1-safe
         installedAt = (Get-Date).ToString("o")
         exitCode = $null
         msiProductCode = $null

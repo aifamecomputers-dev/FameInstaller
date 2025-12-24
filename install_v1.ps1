@@ -332,15 +332,19 @@ try {
       $before = Get-UninstallRegistrySnapshot
 
       $exit = 0
+      $pkgType = "exe"
+      if ($f -match '\.msi$') { $pkgType = "msi" }
+
       $record = [ordered]@{
-        file = $f
-        local = $local
-        type = (if ($f -match '\.msi$') { "msi" } else { "exe" })   # PowerShell 5.1-safe
-        installedAt = (Get-Date).ToString("o")
-        exitCode = $null
-        msiProductCode = $null
-        uninstallEntries = @()
+      file = $f
+      local = $local
+      type = $pkgType
+      installedAt = (Get-Date).ToString("o")
+      exitCode = $null
+      msiProductCode = $null
+      uninstallEntries = @()
       }
+
 
       if ($f -match '\.msi$') {
         $record.msiProductCode = Get-MsiProductCodeFromPackage -MsiPath $local

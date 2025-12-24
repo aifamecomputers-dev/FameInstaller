@@ -140,22 +140,36 @@ function Get-UninstallRegistrySnapshot {
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
     "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
   )
+
   $items = foreach ($p in $paths) {
     Get-ItemProperty $p -ErrorAction SilentlyContinue | ForEach-Object {
+
+      # Safe property getter (works under StrictMode Latest)
+      $get = {
+        param($obj, [string]$name)
+        $prop = $obj.PSObject.Properties[$name]
+        if ($null -ne $prop) { $prop.Value } else { $null }
+      }
+
+      $dn = & $get $_ "DisplayName"
+      if ([string]::IsNullOrWhiteSpace($dn)) { return } # skip entries without DisplayName
+
       [pscustomobject]@{
         KeyName              = $_.PSChildName
-        DisplayName          = $_.DisplayName
-        DisplayVersion       = $_.DisplayVersion
-        Publisher            = $_.Publisher
-        UninstallString      = $_.UninstallString
-        QuietUninstallString = $_.QuietUninstallString
-        InstallLocation      = $_.InstallLocation
-        WindowsInstaller     = $_.WindowsInstaller
+        DisplayName          = $dn
+        DisplayVersion       = (& $get $_ "DisplayVersion")
+        Publisher            = (& $get $_ "Publisher")
+        UninstallString      = (& $get $_ "UninstallString")
+        QuietUninstallString = (& $get $_ "QuietUninstallString")
+        InstallLocation      = (& $get $_ "InstallLocation")
+        WindowsInstaller     = (& $get $_ "WindowsInstaller")
       }
     }
   }
-  return $items | Where-Object { $_.DisplayName } | Sort-Object KeyName, DisplayName
+
+  return $items | Sort-Object KeyName, DisplayName
 }
+
 
 function Find-NewUninstallEntries {
   param(

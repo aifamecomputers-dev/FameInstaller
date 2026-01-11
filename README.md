@@ -2,7 +2,6 @@
 ```Command to Run:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;iwr ('https://raw.githubusercontent.com/aifamecomputers-dev/FameInstaller/main/install_v2.ps1?nocache='+[guid]::NewGuid()) -OutFile $env:TEMP\install_v2.ps1;Unblock-File $env:TEMP\install_v2.ps1;Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy Bypass -File "$env:TEMP\install_v2.ps1" -Org Alpa -ContinueOnError '"
 ```
-
 # FameInstaller - PowerShell Installation Script
 
 A robust, enterprise-grade PowerShell installer for distributing and managing software packages across multiple organizations with built-in Hairpin NAT detection, SSL certificate handling, and automatic reboot recovery.
@@ -18,6 +17,7 @@ A robust, enterprise-grade PowerShell installer for distributing and managing so
 - [Hairpin NAT Issue & Solution](#hairpin-nat-issue--solution)
 - [State & Tracking](#state--tracking)
 - [Scheduled Task Auto-Resume](#scheduled-task-auto-resume)
+- [Uninstallation](#uninstallation)
 - [Troubleshooting](#troubleshooting)
 - [Logging](#logging)
 
@@ -317,7 +317,297 @@ Get-ScheduledTask -TaskName "FameInstaller-Resume-*"
 Unregister-ScheduledTask -TaskName "FameInstaller-Resume-Alpa" -Confirm:$false
 ```
 
-## Troubleshooting
+## Uninstallation
+
+**FameInstaller** includes a comprehensive uninstallation script (`uninstall.ps1`) that safely removes all previously installed packages in reverse order.
+
+### Quick Start
+
+```powershell
+# Basic uninstallation
+.\uninstall.ps1 -Org Alpa
+
+# Preview uninstallation (DryRun - no changes)
+.\uninstall.ps1 -Org Alpa -DryRun
+
+# Continue even if some packages fail
+.\uninstall.ps1 -Org Alpa -ContinueOnError
+```
+
+### How It Works
+
+1. **Reads Installation State**: Loads `C:\ProgramData\FameInstaller\state\<Org>\installed.json`
+2. **Reverses Order**: Uninstalls packages in reverse installation order (last installed, first uninstalled)
+3. **Detects Uninstall Methods**:
+   - Uses MSI ProductCode from registry for MSI packages
+   - Uses QuietUninstallString or UninstallString for EXE packages
+   - Falls back to registry entries if available
+4. **Executes Uninstalls**: Runs silent uninstall commands
+5. **Handles Reboots**: Schedules reboot if exit code 3010 or 1641 is returned
+6. **Tracks Progress**: Records uninstall history in `uninstalled.json`
+
+### Uninstallation Usage Examples
+
+#### Method 1: Direct Execution
+
+```powershell
+.\uninstall.ps1 -Org Alpa
+```
+
+#### Method 2: Preview Before Uninstalling (DryRun)
+
+```powershell
+# See what will be uninstalled without making changes
+.\uninstall.ps1 -Org Alpa -DryRun
+```
+
+Log output will show:
+```
+[2026-01-11 10:30:45] [INFO] Found 3 installed items to uninstall
+[2026-01-11 10:30:45] [INFO] Processing: Package1 (msi)
+[2026-01-11 10:30:45] [INFO] DryRun: skipping execution
+```
+
+#### Method 3: Continue on Errors
+
+```powershell
+# Skip failed uninstalls and continue with remaining packages
+.\uninstall.ps1 -Org Alpa -ContinueOnError
+```
+
+#### Method 4: From Command Prompt or Task Scheduler
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\uninstall.ps1" -Org Alpa
+```
+
+#### Method 5: Batch Uninstallation
+
+```powershell
+# Uninstall both organizations
+.\uninstall.ps1 -Org Alpa
+.\uninstall.ps1 -Org Amax
+```
+
+### Uninstallation Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `-Org` | String | ✓ Yes | Organization name: `Alpa` or `Amax` |
+| `-ContinueOnError` | Switch | ✗ No | Continue uninstalling even if some packages fail |
+| `-DryRun` | Switch | ✗ No | Preview what will be uninstalled without making changes |
+| `-Resumed` | Switch | ✗ No | Internal flag; used after reboot (don't use manually) |
+
+### Uninstallation Output & State Files
+
+**Uninstall Log**: `C:\ProgramData\FameInstaller\logs\uninstall_<Org>_<timestamp>.log`
+
+Example: `uninstall_Alpa_20260111_103045.log`
+
+**Uninstall State**: `C:\ProgramData\FameInstaller\state\<Org>\uninstalled.json`
+
+#### Uninstall State File Format
+
+```json
+{
+  "org": "Alpa",
+  "created": "2026-01-11T10:30:45.0000000Z",
+  "resumed": false,
+  "status": "success",
+  "uninstalledCount": 3,
+  "failedCount": 0,
+  "completed": "2026-01-11T10:31:15.1234567Z",
+  "items": [
+    {
+      "file": "Package1.msi",
+      "displayName": "Package1",
+      "type": "msi",
+      "uninstalledAt": "2026-01-11T10:30:50.0000000Z",
+      "exitCode": 0,
+      "status": "success"
+    },
+    {
+      "file": "NetFx64.exe",
+      "displayName": "NetFx64",
+      "type": "exe",
+      "uninstalledAt": "2026-01-11T10:31:10.0000000Z",
+      "exitCode": 0,
+      "status": "success"
+    }
+  ]
+}
+```
+
+### Uninstallation Best Practices
+
+#### 1. Always Test with DryRun First
+
+```powershell
+# Preview what will happen
+.\uninstall.ps1 -Org Alpa -DryRun
+
+# Review the log
+Get-Content "C:\ProgramData\FameInstaller\logs\uninstall_Alpa_*.log" | tail -50
+```
+
+#### 2. Check Current Installation Status
+
+```powershell
+# View what's currently installed
+Get-Content "C:\ProgramData\FameInstaller\state\Alpa\installed.json" | ConvertFrom-Json | Select-Object -ExpandProperty items | Format-Table file, type, exitCode
+```
+
+#### 3. Handle Failed Uninstalls
+
+```powershell
+# Try with continue-on-error flag
+.\uninstall.ps1 -Org Alpa -ContinueOnError
+
+# Check which packages failed
+Get-Content "C:\ProgramData\FameInstaller\state\Alpa\uninstalled.json" | ConvertFrom-Json | Where-Object { $_.status -eq "failed" }
+```
+
+#### 4. Manual Uninstallation (If Needed)
+
+If the script fails to uninstall a specific package:
+
+```powershell
+# Get the ProductCode from installed.json
+$state = Get-Content "C:\ProgramData\FameInstaller\state\Alpa\installed.json" | ConvertFrom-Json
+$state.items[0].uninstallEntries[0].msiProductCode
+
+# Manual MSI uninstall using ProductCode
+msiexec.exe /x "{ProductCode}" /qn /norestart
+
+# Or find by display name in Registry
+Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\" | 
+  ForEach-Object { Get-ItemProperty $_.PSPath | Where-Object { $_.DisplayName -like "*Package1*" } }
+```
+
+### Uninstallation Common Scenarios
+
+#### Scenario 1: Uninstall Everything
+
+```powershell
+.\uninstall.ps1 -Org Alpa
+```
+
+#### Scenario 2: Preview Before Uninstalling (Safe)
+
+```powershell
+.\uninstall.ps1 -Org Alpa -DryRun
+Get-Content "C:\ProgramData\FameInstaller\logs\uninstall_Alpa_*.log"
+```
+
+#### Scenario 3: Uninstall With Some Failures Expected
+
+```powershell
+# Continue on error if some packages are already removed
+.\uninstall.ps1 -Org Alpa -ContinueOnError
+```
+
+#### Scenario 4: System Reboot Required After Uninstall
+
+```powershell
+# Script auto-detects and schedules reboot
+.\uninstall.ps1 -Org Alpa
+
+# System reboots in 60 seconds
+# Log output will show: "Reboot required detected. System will reboot in 60 seconds..."
+```
+
+To cancel the reboot:
+
+```powershell
+shutdown.exe /a
+```
+
+#### Scenario 5: Uninstall Specific Organization From Task Scheduler
+
+```powershell
+# Create a scheduled task
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\path\to\uninstall.ps1 -Org Alpa"
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+Register-ScheduledTask -TaskName "UninstallAlpa" -Action $action -Trigger $trigger | Out-Null
+```
+
+### Troubleshooting Uninstallation
+
+#### Issue 1: "No installation state found"
+
+**Error**: `No installation state found. Nothing to uninstall.`
+
+**Cause**: No packages were previously installed, or the state file is missing.
+
+**Solution**:
+```powershell
+# Check if state file exists
+Test-Path "C:\ProgramData\FameInstaller\state\Alpa\installed.json"
+
+# If it doesn't exist, nothing to uninstall
+```
+
+#### Issue 2: "No installed items in state file"
+
+**Cause**: State file exists but is empty.
+
+**Solution**:
+```powershell
+# Check state file content
+Get-Content "C:\ProgramData\FameInstaller\state\Alpa\installed.json"
+
+# If empty, manually install packages first
+.\install_v2.ps1 -Org Alpa
+```
+
+#### Issue 3: Uninstall Lock File Exists
+
+**Error**: `Another FameUninstaller run seems active (PID=...)`
+
+**Cause**: Previous uninstall didn't complete or crashed.
+
+**Solution**:
+```powershell
+# Check lock file
+Get-Content "C:\ProgramData\FameInstaller\state\Alpa\uninstall.lock"
+
+# Verify process is dead
+Get-Process -Id {PID} -ErrorAction SilentlyContinue
+
+# Delete stale lock
+Remove-Item "C:\ProgramData\FameInstaller\state\Alpa\uninstall.lock" -Force
+```
+
+#### Issue 4: Some Packages Won't Uninstall
+
+**Error**: `Uninstall returned exit code 1...`
+
+**Cause**: Package already uninstalled, or uninstall method not found.
+
+**Solution**:
+```powershell
+# Use continue-on-error to skip failed packages
+.\uninstall.ps1 -Org Alpa -ContinueOnError
+
+# Check uninstall state for failures
+$state = Get-Content "C:\ProgramData\FameInstaller\state\Alpa\uninstalled.json" | ConvertFrom-Json
+$state.items | Where-Object { $_.status -eq "failed" }
+```
+
+#### Issue 5: Administrator Elevation Failed
+
+**Error**: `Not running as Administrator. Re-launching elevated...` (and nothing happens)
+
+**Cause**: UAC disabled or administrative privileges revoked.
+
+**Solution**:
+```powershell
+# Run PowerShell as Administrator first, then run the script
+# Right-click PowerShell → Run as Administrator
+.\uninstall.ps1 -Org Alpa
+```
+
+
 
 ### Common Issues
 

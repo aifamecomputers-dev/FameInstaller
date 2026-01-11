@@ -35,6 +35,20 @@ $ErrorActionPreference = "Stop"
 # Globals / Paths / Logging / State / Lock
 # ----------------------------
 $script:RebootRequired = $false
+$script:UsingLocalIP = $false
+
+# -------- SSL Certificate Bypass (for local IP workaround) --------
+Add-Type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public class TrustAllCertsPolicy : ICertificatePolicy {
+        public bool CheckValidationResult(
+            ServicePoint srvPoint, X509Certificate certificate,
+            WebRequest request, int certificateProblem) {
+            return true;
+        }
+    }
+"@
 
 $BaseRoot = "C:\ProgramData\FameInstaller"
 $LogDir   = Join-Path $BaseRoot "logs"
@@ -619,6 +633,11 @@ try {
     if ($localIP) {
       $orgPath = if ($Org -eq "Alpa") { "alpa" } else { "amax" }
       $baseUrl = "https://$localIP/$orgPath/"
+      $script:UsingLocalIP = $true
+      
+      # Bypass SSL certificate validation for local IP
+      [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+      Write-Log "SSL certificate validation bypassed for local IP" "WARN"
       Write-Log "Using local IP to avoid Hairpin NAT: $baseUrl" "OK"
     }
   }

@@ -1,4 +1,4 @@
-# FameInstaller
+# FameInstaller - Please run only command that is at ```Command to Run: 
 
 PowerShell-based installer + uninstaller for two organizations:
 
